@@ -57,6 +57,7 @@ import osmnx as ox
 import matplotlib.pyplot as plt
 import re
 import numpy as np
+import cupy as cp
 import xarray as xr
 from scipy.spatial import cKDTree
 
@@ -237,41 +238,118 @@ def haversine_km(lat1, lon1, lat2, lon2):
     c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
+# --- compute correlation best matches with GPU batching ---
+def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000):
+    """
+    Compute best correlation + index between ref_vals and other_vals.
+    ref_vals: (ntime, nref)
+    other_vals: (ntime, nother)
+    Returns:
+      best_corr_valid (nref,), best_idx_valid (nref,)
+    """
+    ref_vals = ref_vals.astype(np.float32)
+    other_vals = other_vals.astype(np.float32)
+
+    ntime, nref = ref_vals.shape
+    _, nother = other_vals.shape
+
+    best_corr = np.full(nref, np.nan, dtype=np.float32)
+    best_idx = np.full(nref, -1, dtype=np.int32)
+
+    # precompute other anomalies
+    other_vals = other_vals - np.nanmean(other_vals, axis=0, keepdims=True)
+    other_vals = np.nan_to_num(other_vals)
+    other_std = np.linalg.norm(other_vals, axis=0)
+
+    other_gpu = cp.asarray(other_vals)
+
+    for start in range(0, nref, batch_size):
+        stop = min(start + batch_size, nref)
+
+        ref_batch = ref_vals[:, start:stop]
+        ref_batch = ref_batch - np.nanmean(ref_batch, axis=0, keepdims=True)
+        ref_batch = np.nan_to_num(ref_batch)
+
+        ref_std = np.linalg.norm(ref_batch, axis=0)
+
+        ref_gpu = cp.asarray(ref_batch)
+        num = ref_gpu.T @ other_gpu  # (batch, nother)
+
+        denom = cp.outer(ref_std, other_std)
+        valid = denom != 0
+        corr = cp.full_like(num, np.nan, dtype=cp.float32)
+        corr[valid] = num[valid] / denom[valid]
+
+        # find best corr + index for each ref point in batch
+        corr_cpu = cp.asnumpy(corr)
+        finite_mask = np.isfinite(corr_cpu)
+        corr_for_argmax = np.where(finite_mask, corr_cpu, -np.inf)
+
+        best_idx_batch = np.argmax(corr_for_argmax, axis=1)
+        best_corr_batch = np.where(
+            ~finite_mask.any(axis=1), np.nan, corr_for_argmax.max(axis=1)
+        )
+
+        best_corr[start:stop] = best_corr_batch
+        best_idx[start:stop] = best_idx_batch
+
+        cp.cuda.Stream.null.synchronize()
+
+    return best_corr, best_idx
+
 def build_conceptual_mapping_full(ref_da, other_da, year=2020,
                                   spatial_fallback=True, fallback_maxdeg=0.5,
                                   station_coords=None):
     """
-    Robust conceptual mapping (full-aligned).
-    Returns (conceptual_map, best_corr_arr, meta).
+    Compute a robust conceptual mapping between a set of reference points and 
+    candidate points based on correlation, with optional spatial fallback.
 
-    conceptual_map: dict mapping ref_key -> other_key or None
-      where ref_key/other_key are either (lat,lon) float tuples or station id strings.
-
-    best_corr_arr: np.array (n_ref_full,) best correlation (np.nan if none)
-
-    meta: dict with diagnostic arrays:
-      'ref_points_full', 'other_points_full', 'ref_valid_mask', 'other_valid_mask',
-      'ref_index_valid', 'other_index_valid'
+    This function:
+      1. Computes correlations between time series anomalies of reference points 
+         and candidate points (batched + memory-safe).
+      2. Selects, for each reference point, the candidate with the highest valid 
+         correlation.
+      3. Handles rows with all-NaN or invalid correlations gracefully by 
+         optionally falling back to nearest spatial neighbor using a KDTree.
+      4. Returns both a conceptual mapping (dict) and a best-correlation array 
+         aligned to the full reference set.
 
     Parameters
     ----------
-    ref_da, other_da : xarray.DataArray
-      Must have time coord and either dims ('time','lat','lon') or ('time','station').
-    year : int
-      Year used to slice the data (ref_da.sel(time=str(year))).
-    spatial_fallback : bool
-      If True, attempt spatial fallback when correlations are invalid.
-    fallback_maxdeg : float or None
-      Maximum allowed distance in degrees for fallback (None => unlimited).
-      Internally converted to km (approx deg->km factor 111.32).
-    station_coords : dict or None
-      Optional mapping station_id -> (lat, lon) or 'lat_lon' string for station fallback.
+    ref_points_full : list
+        Full list of reference point identifiers (station IDs, (lat, lon) tuples, etc.).
+    other_points_full : list
+        Full list of candidate point identifiers.
+    ref_valid_mask : np.ndarray, shape (n_ref_full,)
+        Boolean mask indicating which reference points are valid (non-empty time series).
+    other_valid_mask : np.ndarray, shape (n_other_full,)
+        Boolean mask indicating which candidate points are valid.
+    corr_matrix : np.ndarray, shape (n_ref_valid, n_other_valid)
+        Precomputed correlation matrix between valid reference and candidate points.
+    station_coords_map : dict, optional
+        Mapping from station IDs to (lat, lon) coordinates, used if keys are not numeric.
+    spatial_fallback : bool, default=True
+        Whether to allow nearest-neighbor fallback when correlations are unavailable.
+    fallback_maxdeg : float, optional
+        Maximum search radius for spatial fallback in degrees (converted internally to km).
+
+    Returns
+    -------
+    conceptual_map : dict
+        Mapping {ref_point -> best_candidate_point or None} for all reference points.
+    best_corr_arr : np.ndarray, shape (n_ref_full,)
+        Array of best correlation values aligned with ref_points_full, NaN if unavailable.
+    meta : dict
+        Metadata including:
+            - "ref_points_full", "other_points_full"
+            - "ref_valid_mask", "other_valid_mask"
+            - "ref_index_valid", "other_index_valid"
     """
-    # --- helper: make keys hashable for dict use ---#
+
+    # --- helpers ---
     def _make_hashable(key):
-        """Ensure keys are hashable for dict use."""
         if isinstance(key, np.ndarray):
-            if key.shape == ():  # scalar ndarray
+            if key.shape == ():
                 return str(key.item())
             return tuple(key.tolist())
         elif isinstance(key, (list, tuple)):
@@ -279,10 +357,8 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
         else:
             return key
 
-    # ---- helper: normalize times (drop tz if present) ----
     def _normalize_time_index(arr):
         idx = pd.to_datetime(arr)
-        # handle tz-aware by converting to naive
         try:
             tz = idx.tz
         except Exception:
@@ -297,16 +373,13 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
                     pass
         return idx
 
-    # ---- helper: extract keys safely (tuple floats or station ids as strings) ----
     def _extract_point_coords(points):
         out = []
         for p in points:
             if isinstance(p, (tuple, list, np.ndarray)):
-                # try numeric
                 try:
                     out.append((float(p[0]), float(p[1])) if len(p) == 2 else tuple(map(float, p)))
                 except Exception:
-                    # prefer flat string for single element
                     try:
                         if len(p) == 1:
                             out.append(str(p[0]))
@@ -317,67 +390,28 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
             else:
                 out.append(str(p))
         return np.asarray(out, dtype=object)
-       
-    # --- compute correlation in batches --- #
-    def _compute_corr_batched(ref_anom, other_anom, batch_size=200):
-        """
-        Compute correlation matrix between ref_anom (ntime, nref) and
-        other_anom (ntime, nother) in batches along nref axis.
-        Returns corr_matrix of shape (nref, nother).
-        """
-        ntime, nref = ref_anom.shape
-        _, nother = other_anom.shape
-    
-        corr_matrix = np.full((nref, nother), np.nan, dtype=np.float32)
-    
-        # precompute other norms
-        other_std = np.linalg.norm(np.nan_to_num(other_anom), axis=0)[None, :]
-    
-        for start in range(0, nref, batch_size):
-            stop = min(start + batch_size, nref)
-    
-            ref_batch = ref_anom[:, start:stop]                # (ntime, batch)
-            ref_std = np.linalg.norm(np.nan_to_num(ref_batch), axis=0)[:, None]  # (batch, 1)
-    
-            # numerator
-            num = np.dot(np.nan_to_num(ref_batch).T, np.nan_to_num(other_anom))  # (batch, nother)
-    
-            denom = ref_std * other_std
-            valid = denom != 0
-            corr_sub = np.full_like(num, np.nan, dtype=np.float32)
-            corr_sub[valid] = num[valid] / denom[valid]
-    
-            corr_matrix[start:stop, :] = corr_sub
-    
-        return corr_matrix
-    
-    # ---- optionally normalize station_coords input to dict[str]->(lat,lon) floats ----
+
+    # ---- station_coords map ----
     station_coords_map = None
     if station_coords is not None:
         station_coords_map = {}
         for k, v in station_coords.items():
             key = str(k)
-            if isinstance(v, str):
-                # allow 'lat_lon' like '-1.12_34.4'
-                if "_" in v:
-                    lat_s, lon_s = v.split("_", 1)
-                    station_coords_map[key] = (float(lat_s), float(lon_s))
-                else:
-                    raise ValueError("station_coords string must be 'lat_lon' if string provided")
+            if isinstance(v, str) and "_" in v:
+                lat_s, lon_s = v.split("_", 1)
+                station_coords_map[key] = (float(lat_s), float(lon_s))
             else:
-                # tuple/list etc
                 station_coords_map[key] = (float(v[0]), float(v[1]))
 
-    # ---- normalize time coords and align ----
+    # ---- normalize time + slice ----
     ref_da = ref_da.assign_coords(time=_normalize_time_index(ref_da.time.values))
     other_da = other_da.assign_coords(time=_normalize_time_index(other_da.time.values))
 
     ref_year = ref_da.sel(time=str(year))
     other_year = other_da.sel(time=str(year))
-                                     
-    # only align time   
-    ref_year, other_year = xr.align(ref_year, other_year, join="inner", exclude=["lat", "lon"])
 
+    # only align time
+    ref_year, other_year = xr.align(ref_year, other_year, join="inner", exclude=["lat", "lon"])
 
     # ---- flatten into points ----
     if {"lat", "lon"}.issubset(set(ref_year.dims)):
@@ -390,21 +424,18 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
     else:
         other_flat = other_year.stack(points=("station",))
 
-    # ---- identifiers and data matrices ----
     ref_points_full = _extract_point_coords(ref_flat.points.values)
     other_points_full = _extract_point_coords(other_flat.points.values)
 
-    ref_vals_full = ref_flat.values    # shape (ntime, nref_full)
+    ref_vals_full = ref_flat.values
     other_vals_full = other_flat.values
 
-    # ---- validity masks (not all-NaN across time) ----
+    # ---- validity masks ----
     ref_valid_mask = ~np.isnan(ref_vals_full).all(axis=0)
     other_valid_mask = ~np.isnan(other_vals_full).all(axis=0)
 
     nref_full = ref_points_full.shape[0]
-    nother_full = other_points_full.shape[0]
 
-    # quick exit if nothing valid
     if not ref_valid_mask.any() or not other_valid_mask.any():
         conceptual_map = {ref_points_full[i]: None for i in range(nref_full)}
         return conceptual_map, np.full(nref_full, np.nan), {
@@ -416,43 +447,29 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
             "other_index_valid": np.nonzero(other_valid_mask)[0],
         }
 
-    # ---- restrict to valid columns for vectorized correlation ----
-    ref_vals = ref_vals_full[:, ref_valid_mask]       # (ntime, nref_valid)
-    other_vals = other_vals_full[:, other_valid_mask] # (ntime, nother_valid)
+    # ---- restrict to valid ----
+    ref_vals = ref_vals_full[:, ref_valid_mask]
+    other_vals = other_vals_full[:, other_valid_mask]
 
-    # demean (nanmean tolerates internal NaNs)
-    ref_anom = ref_vals - np.nanmean(ref_vals, axis=0, keepdims=True)
-    other_anom = other_vals - np.nanmean(other_vals, axis=0, keepdims=True)
+    # --- compute best correlation/index ---
+    best_corr_valid, best_idx_valid = _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000)
 
-    # vectorized numerator/denom (approximate if internal NaNs exist)
-    corr_matrix = _compute_corr_batched(ref_anom, other_anom, batch_size=200)
-
-    # handle rows that are all NaN gracefully for idx selection
-    finite_mask = np.isfinite(corr_matrix)
-    all_nan_rows = ~finite_mask.any(axis=1)
-    # prepare a matrix replacing non-finite by -inf for argmax computation
-    corr_for_argmax = np.where(finite_mask, corr_matrix, -np.inf)
-    best_idx_valid = np.argmax(corr_for_argmax, axis=1)            # indices into other_valid reduced set
-    best_corr_valid = np.where(all_nan_rows, np.nan, corr_for_argmax.max(axis=1))
-
-    # ---- prepare for spatial fallback: build KDTree of numeric other points ----
+    # ---- KDTree fallback ----
     other_numeric_idxs = []
     other_numeric_coords = []
     for j, key in enumerate(other_points_full):
-        # if tuple of (lat,lon) floats -> use directly
         if isinstance(key, tuple) and len(key) == 2:
             try:
-                latf = float(key[0]); lonf = float(key[1])
+                latf, lonf = float(key[0]), float(key[1])
                 other_numeric_idxs.append(j)
                 other_numeric_coords.append((latf, lonf))
             except Exception:
                 pass
-        else:
-            # key is a station id string: check station_coords_map
-            if station_coords_map is not None and key in station_coords_map:
-                latf, lonf = station_coords_map[key]
-                other_numeric_idxs.append(j)
-                other_numeric_coords.append((float(latf), float(lonf)))
+        elif station_coords_map is not None and key in station_coords_map:
+            latf, lonf = station_coords_map[key]
+            other_numeric_idxs.append(j)
+            other_numeric_coords.append((float(latf), float(lonf)))
+
     if len(other_numeric_coords) > 0:
         other_numeric_coords = np.asarray(other_numeric_coords)
         kd_tree = cKDTree(other_numeric_coords)
@@ -461,7 +478,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
         kd_tree = None
         km_thresh = None
 
-    # ---- map results back to full reference set ----
+    # ---- map back to full set ----
     conceptual_map = {}
     best_corr_arr = np.full(nref_full, np.nan, dtype=float)
 
@@ -473,13 +490,11 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
         if not ref_valid_mask[i_full]:
             conceptual_map[ref_key] = None
-            best_corr_arr[i_full] = np.nan
             continue
 
         i_positions = np.nonzero(ref_valid_indices == i_full)[0]
         if len(i_positions) == 0:
             conceptual_map[ref_key] = None
-            best_corr_arr[i_full] = np.nan
             continue
 
         i_valid = int(i_positions[0])
@@ -487,53 +502,30 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
         corr_val = best_corr_valid[i_valid]
 
         if np.isnan(corr_val):
-            conceptual_map[ref_key] = None
-            best_corr_arr[i_full] = np.nan
-            continue
-
-        j_full = int(other_valid_indices[j_valid])
-        conceptual_map[ref_key] = _make_hashable(other_points_full[j_full])
-        best_corr_arr[i_full] = float(corr_val)
-
-
-        if np.isnan(corr_val):
-            # correlation unavailable; try spatial fallback if possible
             mapped = None
             if spatial_fallback and (kd_tree is not None):
-                # compute ref numeric coords either from tuple or station_coords_map
                 ref_coord = None
                 if isinstance(ref_key, tuple) and len(ref_key) == 2:
                     try:
                         ref_coord = (float(ref_key[0]), float(ref_key[1]))
                     except Exception:
                         ref_coord = None
-                else:
-                    # ref_key is station-id; try station_coords_map
-                    if station_coords_map is not None and ref_key in station_coords_map:
-                        ref_coord = station_coords_map[ref_key]
+                elif station_coords_map is not None and ref_key in station_coords_map:
+                    ref_coord = station_coords_map[ref_key]
 
                 if ref_coord is not None:
-                    # kd_tree is built on other_numeric_coords; nearest item index -> other_numeric_idxs
                     dist_array, pos = kd_tree.query([ref_coord], k=1)
                     pos = int(pos[0])
                     other_global_idx = int(other_numeric_idxs[pos])
-                    # compute haversine to check threshold (we compare km)
                     other_lat, other_lon = other_numeric_coords[pos]
                     dist_km = haversine_km(ref_coord[0], ref_coord[1], other_lat, other_lon)
                     if (km_thresh is None) or (dist_km <= km_thresh):
                         mapped = other_points_full[other_global_idx]
-                    else:
-                        mapped = None
-                else:
-                    mapped = None
-            else:
-                mapped = None
 
             conceptual_map[ref_key] = mapped
             best_corr_arr[i_full] = np.nan
             continue
 
-        # map j_valid (index into reduced other_valid set) back to global other index
         j_full = int(other_valid_indices[j_valid])
         conceptual_map[ref_key] = other_points_full[j_full]
         best_corr_arr[i_full] = float(corr_val)
@@ -544,11 +536,10 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
         "ref_valid_mask": ref_valid_mask,
         "other_valid_mask": other_valid_mask,
         "ref_index_valid": ref_valid_indices,
-        "other_index_valid": other_valid_indices
+        "other_index_valid": other_valid_indices,
     }
 
     return conceptual_map, best_corr_arr, meta
-
 
 def compare_against_multiple(ref_da, others, year=2020):
     """
