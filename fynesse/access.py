@@ -341,7 +341,10 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
     ref_year = ref_da.sel(time=str(year))
     other_year = other_da.sel(time=str(year))
-    ref_year, other_year = xr.align(ref_year, other_year, join="inner")
+                                     
+    # only align time   
+    ref_year, other_year = xr.align(ref_year, other_year, join="inner", exclude=["lat", "lon"])
+
 
     # ---- flatten into points ----
     if {"lat", "lon"}.issubset(set(ref_year.dims)):
