@@ -639,3 +639,47 @@ def tahmo_to_grid_like(da):
     with stacked (lat, lon) like regular gridded data.
     """
     return da.set_index(station=("lat", "lon"))
+
+def wrap_as_xarray(arr, name, time_index=None, lats=None, lons=None):
+    """
+    Convert (time, lat, lon) numpy array into an xarray DataArray.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array of shape (time, lat, lon).
+    name : str
+        Variable name.
+    time_index : pd.DatetimeIndex, optional
+        Datetime index to use for the time dimension.
+    lats : np.ndarray, optional
+        Array of latitude values of length arr.shape[1].
+    lons : np.ndarray, optional
+        Array of longitude values of length arr.shape[2].
+    """
+    t, ny, nx = arr.shape
+
+    # check time
+    if time_index is not None:
+        assert len(time_index) == t, "Time index length must match array time dimension"
+        time = time_index
+    else:
+        time = np.arange(t)
+
+    # check lats/lons
+    if lats is not None:
+        assert len(lats) == ny, "Latitude length must match array lat dimension"
+    else:
+        lats = np.arange(ny)
+
+    if lons is not None:
+        assert len(lons) == nx, "Longitude length must match array lon dimension"
+    else:
+        lons = np.arange(nx)
+
+    return xr.DataArray(
+        arr,
+        dims=("time", "lat", "lon"),
+        coords={"time": time, "lat": lats, "lon": lons},
+        name=name
+    )
