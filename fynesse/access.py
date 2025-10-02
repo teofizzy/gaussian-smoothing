@@ -596,7 +596,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
     return conceptual_map, best_corr_arr, meta
 
-def compare_against_multiple(ref_da, others, year=2020):
+def compare_against_multiple(ref_da, others, year=2020, use_gpu=True):
     """
     Run both spatial and conceptual mapping for one reference dataset
     against a dictionary of other datasets.
@@ -633,7 +633,7 @@ def compare_against_multiple(ref_da, others, year=2020):
 
         # conceptual alignment (correlation based)
         conceptual_map, best_corr_arr, meta = build_conceptual_mapping_full(
-            ref_da, other_da, year=year
+            ref_da=ref_da, other_da=other_da, year=year, use_gpu=True
         )
 
         results[name] = {
