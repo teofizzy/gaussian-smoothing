@@ -237,18 +237,40 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2.0)**2 + np.cos(lat1r)*np.cos(lat2r)*np.sin(dlon/2.0)**2
     c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
+   
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+   
+def _compute_corr_batched(ref_vals, other_vals, batch_size=2000, use_gpu=False):
+    """
+    Compute best correlation + index between ref_vals and other_vals in batches.
 
-# --- compute correlation best matches with GPU batching ---
-def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000):
+    Parameters
+    ----------
+    ref_vals : ndarray (ntime, nref)
+        Reference series (time × nref gridpoints/stations).
+    other_vals : ndarray (ntime, nother)
+        Comparison series (time × nother gridpoints/stations).
+    batch_size : int
+        Number of reference points to process per batch (default=2000).
+    use_gpu : bool
+        If True and CuPy is available, compute with GPU.
+
+    Returns
+    -------
+    best_corr : ndarray (nref,)
+        Best correlation value per reference point.
+    best_idx : ndarray (nref,)
+        Index into `other_vals` giving the location of best_corr.
     """
-    Compute best correlation + index between ref_vals and other_vals.
-    ref_vals: (ntime, nref)
-    other_vals: (ntime, nother)
-    Returns:
-      best_corr_valid (nref,), best_idx_valid (nref,)
-    """
-    ref_vals = ref_vals.astype(np.float32)
-    other_vals = other_vals.astype(np.float32)
+
+    xp = cp if (use_gpu and cp is not None) else np  # choose backend
+
+    # --- prep data ---
+    ref_vals = np.asarray(ref_vals, dtype=np.float32)
+    other_vals = np.asarray(other_vals, dtype=np.float32)
 
     ntime, nref = ref_vals.shape
     _, nother = other_vals.shape
@@ -256,13 +278,15 @@ def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000):
     best_corr = np.full(nref, np.nan, dtype=np.float32)
     best_idx = np.full(nref, -1, dtype=np.int32)
 
-    # precompute other anomalies
+    # center & nan-safe other
     other_vals = other_vals - np.nanmean(other_vals, axis=0, keepdims=True)
     other_vals = np.nan_to_num(other_vals)
-    other_std = np.linalg.norm(other_vals, axis=0)
 
-    other_gpu = cp.asarray(other_vals)
+    # move to GPU if requested
+    other_xp = xp.asarray(other_vals)
+    other_std = xp.linalg.norm(other_xp, axis=0)
 
+    # --- batch loop ---
     for start in range(0, nref, batch_size):
         stop = min(start + batch_size, nref)
 
@@ -270,18 +294,19 @@ def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000):
         ref_batch = ref_batch - np.nanmean(ref_batch, axis=0, keepdims=True)
         ref_batch = np.nan_to_num(ref_batch)
 
-        ref_std = np.linalg.norm(ref_batch, axis=0)
+        ref_xp = xp.asarray(ref_batch)
+        ref_std = xp.linalg.norm(ref_xp, axis=0)
 
-        ref_gpu = cp.asarray(ref_batch)
-        num = ref_gpu.T @ other_gpu  # (batch, nother)
+        # numerator (batch, nother)
+        num = ref_xp.T @ other_xp
+        denom = xp.outer(ref_std, other_std)
 
-        denom = cp.outer(ref_std, other_std)
         valid = denom != 0
-        corr = cp.full_like(num, np.nan, dtype=cp.float32)
+        corr = xp.full_like(num, xp.nan, dtype=xp.float32)
         corr[valid] = num[valid] / denom[valid]
 
-        # find best corr + index for each ref point in batch
-        corr_cpu = cp.asnumpy(corr)
+        # back to CPU for argmax
+        corr_cpu = xp.asnumpy(corr)
         finite_mask = np.isfinite(corr_cpu)
         corr_for_argmax = np.where(finite_mask, corr_cpu, -np.inf)
 
@@ -293,7 +318,8 @@ def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000):
         best_corr[start:stop] = best_corr_batch
         best_idx[start:stop] = best_idx_batch
 
-        cp.cuda.Stream.null.synchronize()
+        if xp is cp:
+            cp.cuda.Stream.null.synchronize()
 
     return best_corr, best_idx
 
@@ -452,7 +478,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
     other_vals = other_vals_full[:, other_valid_mask]
 
     # --- compute best correlation/index ---
-    best_corr_valid, best_idx_valid = _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000)
+    best_corr, best_idx = _compute_corr_batched(ref_vals, other_vals, batch_size=2000, use_gpu=True)
 
     # ---- KDTree fallback ----
     other_numeric_idxs = []
