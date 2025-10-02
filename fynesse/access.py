@@ -319,7 +319,7 @@ def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000, use_gpu=Tru
 
 def build_conceptual_mapping_full(ref_da, other_da, year=2020,
                                   spatial_fallback=True, fallback_maxdeg=0.5,
-                                  station_coords=None, use_gpu=False,
+                                  station_coords=None, use_gpu=True,
                                   corr_batch_size=2000):
     """
     Compute a robust conceptual mapping between a set of reference points and
@@ -462,7 +462,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
     # ---- compute best correlation (batched) ----
     # returns numpy arrays: best_corr_valid (nref_valid,), best_idx_valid (nref_valid,)
-    best_corr_valid, best_idx_valid = _compute_corr_batched(
+    best_corr_valid, best_idx_valid = _compute_corr_batched_gpu(
         ref_vals, other_vals, batch_size=corr_batch_size, use_gpu=use_gpu
     )
 
