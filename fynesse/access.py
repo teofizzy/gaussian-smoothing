@@ -317,6 +317,39 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
             else:
                 out.append(str(p))
         return np.asarray(out, dtype=object)
+       
+   # --- compute correlation in batches --- #
+   def _compute_corr_batched(ref_anom, other_anom, batch_size=200):
+       """
+       Compute correlation matrix between ref_anom (ntime, nref) and
+       other_anom (ntime, nother) in batches along nref axis.
+       Returns corr_matrix of shape (nref, nother).
+       """
+       ntime, nref = ref_anom.shape
+       _, nother = other_anom.shape
+   
+       corr_matrix = np.full((nref, nother), np.nan, dtype=np.float32)
+   
+       # precompute other norms
+       other_std = np.linalg.norm(np.nan_to_num(other_anom), axis=0)[None, :]
+   
+       for start in range(0, nref, batch_size):
+           stop = min(start + batch_size, nref)
+   
+           ref_batch = ref_anom[:, start:stop]                # (ntime, batch)
+           ref_std = np.linalg.norm(np.nan_to_num(ref_batch), axis=0)[:, None]  # (batch, 1)
+   
+           # numerator
+           num = np.dot(np.nan_to_num(ref_batch).T, np.nan_to_num(other_anom))  # (batch, nother)
+   
+           denom = ref_std * other_std
+           valid = denom != 0
+           corr_sub = np.full_like(num, np.nan, dtype=np.float32)
+           corr_sub[valid] = num[valid] / denom[valid]
+   
+           corr_matrix[start:stop, :] = corr_sub
+   
+       return corr_matrix
 
     # ---- optionally normalize station_coords input to dict[str]->(lat,lon) floats ----
     station_coords_map = None
@@ -392,14 +425,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
     other_anom = other_vals - np.nanmean(other_vals, axis=0, keepdims=True)
 
     # vectorized numerator/denom (approximate if internal NaNs exist)
-    num = np.dot(np.nan_to_num(ref_anom).T, np.nan_to_num(other_anom))  # (nref_valid, nother_valid)
-    ref_std = np.linalg.norm(np.nan_to_num(ref_anom), axis=0)[:, None]
-    other_std = np.linalg.norm(np.nan_to_num(other_anom), axis=0)[None, :]
-    denom = ref_std * other_std
-
-    corr_matrix = np.full_like(num, np.nan, dtype=float)
-    valid_pairs = denom != 0
-    corr_matrix[valid_pairs] = num[valid_pairs] / denom[valid_pairs]
+    corr_matrix = _compute_corr_batched(ref_anom, other_anom, batch_size=200)
 
     # handle rows that are all NaN gracefully for idx selection
     finite_mask = np.isfinite(corr_matrix)
