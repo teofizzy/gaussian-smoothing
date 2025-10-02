@@ -244,26 +244,38 @@ try:
 except ImportError:
     cp = None
    
-def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000, use_gpu=True, show_progress=True):
+def _compute_corr_batched(ref_vals, other_vals, batch_size=2000, use_gpu=True, show_progress=True):
     """
-    Compute best correlation + index between ref_vals and other_vals, in batches.
-    Uses GPU with CuPy if use_gpu=True, else CPU (NumPy).
-    
-    Args:
-      ref_vals: (ntime, nref) NumPy array
-      other_vals: (ntime, nother) NumPy array
-      batch_size: number of ref points to process per batch
-      use_gpu: whether to use GPU (requires CuPy)
-      show_progress: if True, show tqdm progress bar
-    
-    Returns:
-      best_corr (nref,)
-      best_idx (nref,)
-    """
-    xp = cp if use_gpu else np
+    Batched best-correlation finder between reference time-series and candidate time-series.
 
-    ref_vals = ref_vals.astype(np.float32)
-    other_vals = other_vals.astype(np.float32)
+    For each reference column (ntime,), find the index of the other column with the highest
+    Pearson correlation (computed using centered series). Works with NumPy (CPU) or CuPy (GPU).
+
+    Parameters
+    ----------
+    ref_vals : ndarray, shape (ntime, nref)
+        Time × reference points.
+    other_vals : ndarray, shape (ntime, nother)
+        Time × candidate points.
+    batch_size : int
+        Number of reference columns processed per batch.
+    use_gpu : bool
+        If True and CuPy is available, run heavy math on GPU.
+    show_progress : bool
+        Show tqdm progress bar for batches.
+
+    Returns
+    -------
+    best_corr : ndarray, shape (nref,)
+      Best correlation value per reference column (np.nan if none valid).
+    best_idx : ndarray, shape (nref,)
+      Index (0..nother-1) of best candidate per reference column (-1 if none).
+    """
+    xp = cp if (use_gpu and cp is not None) else np
+
+    # ensure float32 in CPU memory first (we convert to xp arrays inside)
+    ref_vals = np.asarray(ref_vals, dtype=np.float32)
+    other_vals = np.asarray(other_vals, dtype=np.float32)
 
     ntime, nref = ref_vals.shape
     _, nother = other_vals.shape
@@ -271,48 +283,60 @@ def _compute_corr_batched_gpu(ref_vals, other_vals, batch_size=2000, use_gpu=Tru
     best_corr = np.full(nref, np.nan, dtype=np.float32)
     best_idx = np.full(nref, -1, dtype=np.int32)
 
-    # anomalies + standardization
-    other_vals = other_vals - np.nanmean(other_vals, axis=0, keepdims=True)
-    other_vals = np.nan_to_num(other_vals)
-    other_std = np.linalg.norm(other_vals, axis=0)
+    # Move other_vals to backend xp and center there (nan-safe)
+    other_xp = xp.asarray(other_vals)                 # cupy or numpy array on correct backend
+    # use xp.nanmean if available; cupy has nanmean in modern versions
+    try:
+        other_mean = xp.nanmean(other_xp, axis=0, keepdims=True)
+    except AttributeError:
+        # fallback: compute on CPU and move to xp
+        other_mean = xp.asarray(np.nanmean(other_vals, axis=0, keepdims=True))
+    other_xp = other_xp - other_mean
+    other_xp = xp.nan_to_num(other_xp)                # replace NaNs with 0
+    other_std = xp.linalg.norm(other_xp, axis=0)      # xp.linalg.norm (cupy or numpy)
 
-    other_gpu = xp.asarray(other_vals)
-
+    batch_count = (nref + batch_size - 1) // batch_size
     iterator = range(0, nref, batch_size)
     if show_progress:
-        iterator = tqdm(iterator, total=(nref + batch_size - 1) // batch_size, desc="Batches")
+        iterator = tqdm(iterator, total=batch_count, desc="Batches")
 
     for start in iterator:
         stop = min(start + batch_size, nref)
+        ref_batch = ref_vals[:, start:stop]            # still a NumPy array on host
 
-        ref_batch = ref_vals[:, start:stop]
-        ref_batch = ref_batch - np.nanmean(ref_batch, axis=0, keepdims=True)
-        ref_batch = np.nan_to_num(ref_batch)
+        # move ref batch to xp and center (nan-safe) on same backend
+        ref_xp = xp.asarray(ref_batch)
+        try:
+            ref_mean = xp.nanmean(ref_xp, axis=0, keepdims=True)
+        except AttributeError:
+            ref_mean = xp.asarray(np.nanmean(ref_batch, axis=0, keepdims=True))
+        ref_xp = ref_xp - ref_mean
+        ref_xp = xp.nan_to_num(ref_xp)
+        ref_std = xp.linalg.norm(ref_xp, axis=0)      # shape (batch,)
 
-        ref_std = np.linalg.norm(ref_batch, axis=0)
+        # numerator and denominator on xp
+        # num shape: (batch, nother)
+        num = ref_xp.T @ other_xp                      # uses xp matmul
+        denom = xp.outer(ref_std, other_std)           # xp.outer
 
-        ref_gpu = xp.asarray(ref_batch)
-        num = ref_gpu.T @ other_gpu  # (batch, nother)
-
-        denom = xp.outer(ref_std, other_std)
+        # compute correlation safely
         valid = denom != 0
-        corr = xp.full_like(num, np.nan, dtype=xp.float32)
+        corr = xp.full_like(num, xp.nan, dtype=xp.float32)
         corr[valid] = num[valid] / denom[valid]
 
-        # bring to CPU
-        corr_cpu = cp.asnumpy(corr) if use_gpu else corr
+        # move to CPU for argmax/argmax-with-masked -inf
+        corr_cpu = cp.asnumpy(corr) if xp is cp else corr
         finite_mask = np.isfinite(corr_cpu)
         corr_for_argmax = np.where(finite_mask, corr_cpu, -np.inf)
 
         best_idx_batch = np.argmax(corr_for_argmax, axis=1)
-        best_corr_batch = np.where(
-            ~finite_mask.any(axis=1), np.nan, corr_for_argmax.max(axis=1)
-        )
+        best_corr_batch = np.where(~finite_mask.any(axis=1), np.nan, corr_for_argmax.max(axis=1))
 
         best_corr[start:stop] = best_corr_batch
         best_idx[start:stop] = best_idx_batch
 
-        if use_gpu:
+        if xp is cp:
+            # ensure GPU work completed
             cp.cuda.Stream.null.synchronize()
 
     return best_corr, best_idx
@@ -462,7 +486,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
     # ---- compute best correlation (batched) ----
     # returns numpy arrays: best_corr_valid (nref_valid,), best_idx_valid (nref_valid,)
-    best_corr_valid, best_idx_valid = _compute_corr_batched_gpu(
+    best_corr_valid, best_idx_valid = _compute_corr_batched(
         ref_vals, other_vals, batch_size=corr_batch_size, use_gpu=use_gpu
     )
 
