@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from random import sample
 import numpy as np
+from . import address
 
 
 
@@ -293,11 +294,11 @@ def compare_correlation_against_many(ref_series, others_dict, sigmas=[0, 1, 2, 5
     results = {}
     for name, series in others_dict.items():
         print(f"Comparing {name}...")
-        results[name] = compute_correlation_with_smoothing(
+        results[name] = address.compute_correlation_with_smoothing(
             ref_series, series, sigmas=sigmas
             )
         if plot:
-            plot_correlation_with_smoothing(
+            address.plot_correlation_with_smoothing(
                 results[name][0],
                 results[name][1],
                 results[name][2],
@@ -365,7 +366,7 @@ def compute_station_correlations_df(
 
             # compute correlations for each dataset and sigma
             for dataset_name, other_series in others.items():
-                correlations, _, _ = compute_correlation_with_smoothing(
+                correlations, _, _ = address.compute_correlation_with_smoothing(
                     tahmo_series, other_series, sigmas=sigmas
                 )
                 for sigma, corr in correlations.items():
