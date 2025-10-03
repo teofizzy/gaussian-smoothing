@@ -7,6 +7,10 @@ from . import access
 import osmnx as ox
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from random import sample
+import numpy as np
+
+
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -264,3 +268,119 @@ def plot_city_map(city, country, latitude=None, longitude=None, box_size=2, plot
     ax.set_ylim(bbox[1], bbox[3])
     ax.set_title(place_name, fontsize=14)
     plt.show()
+
+def compare_correlation_against_many(ref_series, others_dict, sigmas=[0, 1, 2, 5], plot=False):
+    """
+    Compare correlations of one reference series vs many others,
+    with optional Gaussian smoothing.
+
+    Parameters
+    ----------
+    ref_series : array-like or pd.Series
+        Reference time series (e.g., TAHMO station).
+    others_dict : dict[str, array-like or pd.Series]
+        Dictionary of {name: time_series} to compare against.
+    sigmas : list of int/float
+        Gaussian kernel widths to test. 0 means no smoothing.
+    plot : bool
+        If True, plots correlation vs sigma for each dataset.
+
+    Returns
+    -------
+    results : dict
+        {name: {sigma: correlation_value}}
+    """
+    results = {}
+    for name, series in others_dict.items():
+        print(f"Comparing {name}...")
+        results[name] = compute_correlation_with_smoothing(
+            ref_series, series, sigmas=sigmas
+            )
+        if plot:
+            plot_correlation_with_smoothing(
+                results[name][0],
+                results[name][1],
+                results[name][2],
+                ref_name="TAHMO",
+                other_name=name
+            )
+    return results
+
+from random import sample
+
+def compute_station_correlations_df(
+    metadata_df,
+    tahmo_da, chirps_da, tamsat_da, era5_da,
+    sigmas=[0, 1, 2, 5, 10, 20],
+    use_all_stations=False,
+    n_random=None,
+    random_state=42
+):
+    """
+    Compute gaussian-filtered correlations between TAHMO and other datasets.
+
+    Args:
+        metadata_df (pd.DataFrame): Contains station metadata with 'code', 'location.latitude', 'location.longitude'
+        tahmo_da (xr.DataArray): TAHMO data with dimension 'station'
+        chirps_da, tamsat_da, era5_da (xr.DataArray): Gridded datasets with lat/lon
+        sigmas (list): Gaussian filter widths
+        use_all_stations (bool): If True, compute for all stations in metadata_df
+        n_random (int): If set, randomly select N stations instead of all
+        random_state (int): Random seed
+
+    Returns:
+        pd.DataFrame with columns:
+            ['station_code', 'lat', 'lon', 'dataset', 'sigma', 'correlation']
+    """
+    # --- station selection logic ---
+    stations = list(metadata_df["code"].values)
+
+    if use_all_stations:
+        selected_stations = stations
+    elif n_random is not None:
+        rng = np.random.RandomState(random_state)
+        selected_stations = rng.choice(stations, size=n_random, replace=False)
+    else:
+        raise ValueError("Must set either use_all_stations=True or provide n_random.")
+
+    all_results = []
+
+    # --- main loop ---
+    for station_code in selected_stations:
+        row = metadata_df[metadata_df['code'] == station_code].iloc[0]
+        lat, lon = row['location.latitude'], row['location.longitude']
+
+        try:
+            # extract aligned series
+            tahmo_series = tahmo_da.sel(station=station_code).values
+            chirps_series = chirps_da.sel(lat=lat, lon=lon, method="nearest").values
+            tamsat_series = tamsat_da.sel(lat=lat, lon=lon, method="nearest").values
+            era5_series = era5_da.sel(lat=lat, lon=lon, method="nearest").values
+
+            others = {
+                "CHIRPS": chirps_series,
+                "ERA5": era5_series,
+                "TAMSAT": tamsat_series,
+            }
+
+            # compute correlations for each dataset and sigma
+            for dataset_name, other_series in others.items():
+                correlations, _, _ = compute_correlation_with_smoothing(
+                    tahmo_series, other_series, sigmas=sigmas
+                )
+                for sigma, corr in correlations.items():
+                    all_results.append({
+                        "station_code": station_code,
+                        "lat": lat,
+                        "lon": lon,
+                        "dataset": dataset_name,
+                        "sigma": sigma,
+                        "correlation": corr
+                    })
+
+            print(f"Processed station {station_code} successfully.")
+
+        except Exception as e:
+            print(f"Skipping station {station_code} due to error: {e}")
+
+    return pd.DataFrame(all_results)
