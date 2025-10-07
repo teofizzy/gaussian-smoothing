@@ -7,11 +7,16 @@ This module handles question addressing functionality including:
 - Data visualization for decision-making
 - Dashboard creation
 """
+from . import access
+from . import assess
 
 from typing import Any, Union
 import pandas as pd
 import logging
 import numpy as np
+import xarray as xr
+import math
+from typing import Tuple, Dict
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -292,3 +297,263 @@ def plot_correlations_df(df, max_cols=2):
 
     plt.tight_layout()
     plt.show()
+
+# helper: safe pearson that returns nan if constant / insufficient length
+def safe_pearson(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return np.nan
+    if np.nanstd(x[mask]) == 0 or np.nanstd(y[mask]) == 0: # check for variability
+        return np.nan
+    return pearsonr(x[mask], y[mask])[0]
+
+# station diagnostics: missing frac, wet-day frac (>0), mean, std, # nonzero days
+def station_diagnostics(series, wet_thresh=0.1):
+    """
+    Parameters:
+        series (time series)
+        wet_thresh (float): threshold for wet days in mm
+    Returns:
+        dict with missing_frac, wet_frac, mean, std, n_wet
+    """
+    s = np.asarray(series, dtype=float)
+    valid = np.isfinite(s)
+    n = s.size
+    n_valid = valid.sum()
+    missing_frac = 1.0 - (n_valid / n)
+    if n_valid == 0:
+        return {
+            "missing_frac": missing_frac,
+            "wet_frac": np.nan,
+            "mean": np.nan,
+            "std": np.nan,
+            "n_wet": np.nan
+        }
+    valid_vals = s[valid]
+    n_wet = (valid_vals > wet_thresh).sum()
+    wet_frac = n_wet / n_valid
+    return {
+        "missing_frac": missing_frac,
+        "wet_frac": wet_frac,
+        "mean": float(np.nanmean(valid_vals)),
+        "std": float(np.nanstd(valid_vals, ddof=0)),
+        "n_wet": int(n_wet)
+    }
+
+# block bootstrap correlation CI for difference of correlations (paired series)
+def block_bootstrap_corr_diff(a, b, c, d, block_size=7, n_iter=1000, random_state=0):
+    """
+    Parameters:
+        Block bootstrap to estimate distribution of corr(a,b) - corr(c,d).
+        a,b: series for baseline (e.g. sigma=0)
+        c,d: series for test (e.g. sigma=5)
+    Return: dict with mean_diff, ci_lower, ci_upper, p_two_sided (proportion <=0)
+    """
+    rng = np.random.default_rng(random_state)
+    n = len(a)
+    if n != len(b) or n != len(c) or n != len(d):
+        raise ValueError("All series must have same length")
+    # create block start indices
+    block_starts = np.arange(0, n, block_size)
+    # list of blocks (start, stop)
+    blocks = [(i, min(i+block_size, n)) for i in block_starts]
+    mblocks = len(blocks)
+    diffs = np.empty(n_iter, dtype=float)
+    for it in range(n_iter):
+        # sample blocks with replacement until we reach n
+        idxs = []
+        while len(idxs) < n:
+            bidx = rng.integers(0, mblocks)
+            s, e = blocks[bidx]
+            idxs.extend(range(s, e))
+        idxs = idxs[:n]
+        a_samp = a[idxs]; b_samp = b[idxs]; c_samp = c[idxs]; d_samp = d[idxs]
+        r1 = safe_pearson(a_samp, b_samp)
+        r2 = safe_pearson(c_samp, d_samp)
+        diffs[it] = (r2 if not np.isnan(r2) else 0.0) - (r1 if not np.isnan(r1) else 0.0)
+    mean_diff = np.nanmean(diffs)
+    ci_lower, ci_upper = np.nanpercentile(diffs, [2.5, 97.5])
+    p_two_sided = np.mean(np.abs(diffs) >= abs(mean_diff))
+    return {"mean_diff": mean_diff, "ci": (ci_lower, ci_upper), "p_two_sided": p_two_sided, "diffs": diffs}
+
+def pick_best_worst(df, dataset="CHIRPS", sigma=5, topk=3):
+    """
+    df: correlations df with columns ['station_code','dataset','sigma','correlation','lat','lon']
+    returns (best_codes, worst_codes) lists of station codes (topk each)
+    """
+    sub = df[(df['dataset'] == dataset) & (df['sigma'] == sigma)].copy()
+    if sub.empty:
+        raise ValueError("No rows for dataset/sigma")
+    sub = sub.dropna(subset=['correlation'])
+    sub_sorted = sub.sort_values('correlation', ascending=False)
+    best = sub_sorted.head(topk)['station_code'].tolist()
+    worst = sub_sorted.tail(topk)['station_code'].tolist()
+    return best, worst
+
+def plot_station_pair_time_series(
+    station_code,
+    metadata_df,
+    tahmo_da,
+    other_da,
+    other_name="CHIRPS",
+    sigma=5,
+    sig0=0,
+    kernel_for_other="temporal",  # 'temporal' means apply gaussian_filter1d to sampled point
+    plot_show=True
+):
+    """
+    Plot TAHMO vs other (sampled at station lat/lon) for sigma=sig0 and sigma=sigma.
+    Returns dict of diagnostics, correlations, Δr, and spatial distance.
+    """
+    # lookup coords
+    row = metadata_df[metadata_df['code'] == station_code]
+    if row.empty:
+        raise KeyError(f"station {station_code} not in metadata")
+    row = row.iloc[0]
+    lat_ref = float(row['location.latitude'])
+    lon_ref = float(row['location.longitude'])
+
+    # get raw series (TAHMO)
+    tahmo_series = tahmo_da.sel(station=station_code).values.astype(float)
+
+    # sample other at nearest gridpoint
+    sel = other_da.sel(lat=lat_ref, lon=lon_ref, method="nearest")
+    other_series = sel.values.astype(float)
+
+    # get coordinates of the selected gridpoint (to compute distance)
+    lat_other = float(sel.lat.values)
+    lon_other = float(sel.lon.values)
+
+    # compute spatial distance
+    dist_km = access.haversine_km(lat_ref, lon_ref, lat_other, lon_other)
+
+    # --- smoothing helper ---
+    def smooth_1d(series, sigma_val):
+        if sigma_val is None or sigma_val == 0:
+            return series.copy()
+        s = np.asarray(series, dtype=float)
+        mask = np.isfinite(s)
+        if mask.sum() == 0:
+            return np.full_like(s, np.nan)
+        s0 = np.where(mask, s, 0.0)
+        num = gaussian_filter1d(s0, sigma=sigma_val, mode='nearest')
+        w = gaussian_filter1d(mask.astype(float), sigma=sigma_val, mode='nearest')
+        out = np.where(w > 1e-6, num / w, np.nan)
+        return out
+
+    # --- compute smoothed series ---
+    tahmo_s0 = smooth_1d(tahmo_series, sig0)
+    tahmo_sS = smooth_1d(tahmo_series, sigma)
+    other_s0 = smooth_1d(other_series, sig0)
+    other_sS = smooth_1d(other_series, sigma)
+
+    # --- correlations ---
+    r_raw = safe_pearson(tahmo_s0, other_s0)
+    r_smooth = safe_pearson(tahmo_sS, other_sS)
+    delta_r = r_smooth - r_raw
+
+    # --- diagnostics summary ---
+    diag = {
+        "station_code": station_code,
+        "lat_ref": lat_ref,
+        "lon_ref": lon_ref,
+        "lat_other": lat_other,
+        "lon_other": lon_other,
+        "distance_km": dist_km,
+        "corr_raw": r_raw,
+        "corr_sigma": r_smooth,
+        "delta_r": delta_r,
+        "tahmo_diag_raw": station_diagnostics(tahmo_s0),
+        "tahmo_diag_sigma": station_diagnostics(tahmo_sS),
+        "other_diag_raw": station_diagnostics(other_s0),
+        "other_diag_sigma": station_diagnostics(other_sS),
+        "tahmo_series_raw": tahmo_s0,
+        "tahmo_series_sigma": tahmo_sS,
+        "other_series_raw": other_s0,
+        "other_series_sigma": other_sS,
+    }
+
+    # --- plotting ---
+    if plot_show:
+        # Use actual time coordinate instead of numeric index
+        if "time" in tahmo_da.dims:
+            time_idx = pd.to_datetime(tahmo_da["time"].values)
+        else:
+            time_idx = np.arange(len(tahmo_series))
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+
+        axes[0].plot(time_idx, tahmo_s0, label="TAHMO")
+        axes[0].plot(time_idx, other_s0, '--', label=f"{other_name} raw")
+        axes[0].set_title(
+            f"{station_code} raw (σ=0)  r={r_raw:.3f}  dist={dist_km:.1f} km"
+        )
+        axes[0].legend()
+
+        axes[1].plot(time_idx, tahmo_sS - np.nanmean(tahmo_sS), label=f"TAHMO σ={sigma}")
+        axes[1].plot(time_idx, other_sS - np.nanmean(other_sS), '--', label=f"{other_name} σ={sigma}")
+        axes[1].set_title(
+            f"{station_code} smoothed σ={sigma}  r={r_smooth:.3f}  Δr={delta_r:+.3f}"
+        )
+        axes[1].legend()
+
+        plt.xlabel("time index")
+        plt.tight_layout()
+        plt.show()
+
+    return diag
+
+def compare_sigma_levels(df, dataset="CHIRPS", sigma_high=5, sigma_low=0, topk=3):
+    """
+    Compare correlation changes for best and worst stations between sigma_high and sigma_low.
+    Returns a DataFrame summarizing the difference.
+    """
+    best, worst = pick_best_worst(df, dataset=dataset, sigma=sigma_high, topk=topk)
+    target_stations = best + worst
+
+    sub = df[(df['dataset'] == dataset) & (df['station_code'].isin(target_stations))]
+
+    # pivot sigma values into columns for easy comparison
+    pivoted = sub.pivot_table(
+        index='station_code', columns='sigma', values='correlation'
+    ).reset_index()
+
+    pivoted['delta'] = pivoted[sigma_high] - pivoted[sigma_low]
+    pivoted['type'] = pivoted['station_code'].apply(
+        lambda x: "best" if x in best else "worst"
+    )
+
+    return pivoted.sort_values('type')
+
+def inspect_best_worst(
+    df,
+    metadata_df,
+    tahmo_da,
+    other_da,
+    other_name="CHIRPS",
+    sigma=5,
+    topk=3,
+    sig0=0,
+    block_bootstrap_kwargs={"block_size":7, "n_iter":1000, "random_state":0}
+):
+    best, worst = pick_best_worst(df, dataset=other_name, sigma=sigma, topk=topk)
+    picks = {"best": best, "worst": worst}
+    results = {}
+    for kind, codes in picks.items():
+        results[kind] = []
+        for code in codes:
+            diag = plot_station_pair_time_series(
+                code, metadata_df, tahmo_da, other_da,
+                other_name=other_name, sigma=sigma, sig0=sig0, plot_show=True
+            )
+            # bootstrap test: compare raw corr vs sigma corr for this station
+            a = diag["tahmo_series_raw"]
+            b = diag["other_series_raw"]
+            c = diag["tahmo_series_sigma"]
+            d = diag["other_series_sigma"]
+            bb = block_bootstrap_corr_diff(a, b, c, d, **block_bootstrap_kwargs)
+            diag["bootstrap"] = bb
+            results[kind].append(diag)
+    return results
