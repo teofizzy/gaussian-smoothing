@@ -492,8 +492,8 @@ def plot_station_pair_time_series(
         )
         axes[0].legend()
 
-        axes[1].plot(time_idx, tahmo_sS - np.nanmean(tahmo_sS), label=f"TAHMO σ={sigma}")
-        axes[1].plot(time_idx, other_sS - np.nanmean(other_sS), '--', label=f"{other_name} σ={sigma}")
+        axes[1].plot(time_idx, tahmo_sS, label=f"TAHMO σ={sigma}")
+        axes[1].plot(time_idx, other_sS, '--', label=f"{other_name} σ={sigma}")
         axes[1].set_title(
             f"{station_code} smoothed σ={sigma}  r={r_smooth:.3f}  Δr={delta_r:+.3f}"
         )
