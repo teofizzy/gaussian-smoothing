@@ -238,11 +238,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2.0)**2 + np.cos(lat1r)*np.cos(lat2r)*np.sin(dlon/2.0)**2
     c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
-   
-try:
-    import cupy as cp
-except ImportError:
-    cp = None
+
    
 def _compute_corr_batched(ref_vals, other_vals, batch_size=2000, use_gpu=True, show_progress=True):
     """
@@ -422,6 +418,16 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
             else:
                 out.append(str(p))
         return np.asarray(out, dtype=object)
+    try:
+        import cupy as cp
+    except ImportError:
+        cp = None
+    try:
+        xp = cp if (use_gpu and cp is not None) else np
+    except Exception as e:
+        print(f"⚠️ GPU backend failed ({e}), using CPU fallback.")
+        xp = np
+        use_gpu = False
 
     # -------- station coords normalization --------
     station_coords_map = None
@@ -596,7 +602,7 @@ def build_conceptual_mapping_full(ref_da, other_da, year=2020,
 
     return conceptual_map, best_corr_arr, meta
 
-def compare_against_multiple(ref_da, others, year=2020, use_gpu=True):
+def compare_against_multiple(ref_da, others, year=2020, use_gpu=False):
     """
     Run both spatial and conceptual mapping for one reference dataset
     against a dictionary of other datasets.
@@ -623,7 +629,7 @@ def compare_against_multiple(ref_da, others, year=2020, use_gpu=True):
     """
     results = {}
     for name, other_da in others.items():
-        print(f"Processing {name}...")
+        print(f"→ Processing {name} for {year} (GPU={use_gpu})")
 
         # spatial alignment (nearest grid points)
         spatial_map = build_spatial_mapping(
@@ -633,8 +639,12 @@ def compare_against_multiple(ref_da, others, year=2020, use_gpu=True):
 
         # conceptual alignment (correlation based)
         conceptual_map, best_corr_arr, meta = build_conceptual_mapping_full(
-            ref_da=ref_da, other_da=other_da, year=year, use_gpu=True
+            ref_da=ref_da,
+            other_da=other_da,
+            year=year,
+            use_gpu=use_gpu,  # ← propagate the flag
         )
+
 
         results[name] = {
             "spatial": spatial_map,
