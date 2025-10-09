@@ -17,6 +17,8 @@ import numpy as np
 import xarray as xr
 import math
 from typing import Tuple, Dict
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -30,7 +32,6 @@ import sklearn.tree as tree
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
-
 
 # import GPy
 import torch
@@ -557,3 +558,81 @@ def inspect_best_worst(
             diag["bootstrap"] = bb
             results[kind].append(diag)
     return results
+
+
+def plot_sigma_map_cartopy(df_corr, df_delta, dataset="CHIRPS", sigma_low=0, sigma_high=5, cmap="RdBu_r"):
+    """
+    Plot correlation differences on a map of Kenya using Cartopy, highlighting
+    the best and worst Δ correlation stations with arrows and labels.
+
+    Parameters:
+        df_corr (pd.DataFrame): Columns are station_code, lat, lon, dataset, and correlation.
+        df_delta (pd.DataFrame): Columns are station_code and delta_r.
+    """
+    # --- Merge coordinate + delta info ---
+    df_plot = df_corr[['station_code', 'lat', 'lon']].drop_duplicates().merge(
+        df_delta, on='station_code', how='inner'
+    )
+    df_plot = df_plot.loc[df_plot['dataset'] == dataset]
+
+    # --- Identify best & worst stations ---
+    best_station = df_plot.loc[df_plot[sigma_high].idxmax()]
+    worst_station = df_plot.loc[df_plot[sigma_high].idxmin()]
+
+    # --- Create figure ---
+    fig, ax = plt.subplots(
+        figsize=(7, 8),
+        subplot_kw={'projection': ccrs.PlateCarree()}
+    )
+
+    # --- Add map features ---
+    ax.set_extent([33.5, 42.5, -5, 5])  # Kenya region
+    ax.add_feature(cfeature.BORDERS, linewidth=1)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+    ax.add_feature(cfeature.LAKES, alpha=0.5)
+    ax.add_feature(cfeature.RIVERS, alpha=0.3)
+    ax.add_feature(cfeature.LAND, facecolor="whitesmoke")
+
+    # --- Plot all stations ---
+    sc = ax.scatter(
+        df_plot['lon'], df_plot['lat'],
+        c=df_plot['delta_r'], cmap=cmap,
+        s=60, edgecolor='k', linewidth=0.5,
+        transform=ccrs.PlateCarree()
+    )
+
+    # --- Highlight best station ---
+    ax.scatter(best_station['lon'], best_station['lat'],
+               s=120, c='green', edgecolor='black', marker='^', label='Best Δr',
+               transform=ccrs.PlateCarree())
+
+    ax.annotate(
+        f"{best_station['station_code']} (Best)",
+        xy=(best_station['lon'], best_station['lat']),
+        xytext=(best_station['lon'] + 0.3, best_station['lat'] + 0.3),
+        arrowprops=dict(facecolor='green', arrowstyle='->', lw=1.5),
+        fontsize=9,
+        transform=ccrs.PlateCarree()
+    )
+
+    # --- Highlight worst station ---
+    ax.scatter(worst_station['lon'], worst_station['lat'],
+               s=120, c='red', edgecolor='black', marker='v', label='Worst Δr',
+               transform=ccrs.PlateCarree())
+
+    ax.annotate(
+        f"{worst_station['station_code']} (Worst)",
+        xy=(worst_station['lon'], worst_station['lat']),
+        xytext=(worst_station['lon'] + 0.3, worst_station['lat'] - 0.5),
+        arrowprops=dict(facecolor='red', arrowstyle='->', lw=1.5),
+        fontsize=9,
+        transform=ccrs.PlateCarree()
+    )
+
+    # --- Add colorbar & legend ---
+    cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
+    cb.set_label(f"Δ Correlation (σ={sigma_high} − σ={sigma_low})")
+
+    ax.legend(loc='lower left', fontsize=9)
+    plt.title("Change in Station Correlation after Smoothing (Kenya)", fontsize=12)
+    plt.show()
