@@ -16,9 +16,10 @@ import logging
 import numpy as np
 import xarray as xr
 import math
+import os
 from typing import Tuple, Dict
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
+# import cartopy.crs as ccrs
+# import cartopy.feature as cfeature
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -34,8 +35,8 @@ from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
 
 # import GPy
-import torch
-import tensorflow as tf
+# import torch
+# import tensorflow as tf
 
 # Or if it's a statistical analysis
 import scipy.stats
@@ -560,79 +561,233 @@ def inspect_best_worst(
     return results
 
 
-def plot_sigma_map_cartopy(df_corr, df_delta, dataset="CHIRPS", sigma_low=0, sigma_high=5, cmap="RdBu_r"):
+import os
+import json
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km between points (scalars or arrays)."""
+    R = 6371.0
+    lat1r = np.radians(lat1); lon1r = np.radians(lon1)
+    lat2r = np.radians(lat2); lon2r = np.radians(lon2)
+    dlat = lat2r - lat1r
+    dlon = lon2r - lon1r
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1r)*np.cos(lat2r)*np.sin(dlon/2.0)**2
+    c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+
+def plot_station_pair_time_series_multi(
+    station_code,
+    metadata_df,
+    tahmo_da,
+    other_datasets,  # list of tuples: [(other_da, "CHIRPS"), (other_da2, "ERA5"), ...]
+    sigma=5,
+    sig0=0,
+    kernel_for_other="temporal",
+    plot_show=True,
+    save_dir=None
+):
     """
-    Plot correlation differences on a map of Kenya using Cartopy, highlighting
-    the best and worst Δ correlation stations with arrows and labels.
-
-    Parameters:
-        df_corr (pd.DataFrame): Columns are station_code, lat, lon, dataset, and correlation.
-        df_delta (pd.DataFrame): Columns are station_code and delta_r.
+    Plot TAHMO vs multiple other datasets (sampled at station lat/lon)
+    for sigma=sig0 and sigma=sigma.
+    Optionally saves the plot and diagnostic JSON to `save_dir`.
     """
-    # --- Merge coordinate + delta info ---
-    df_plot = df_corr[['station_code', 'lat', 'lon']].drop_duplicates().merge(
-        df_delta, on='station_code', how='inner'
-    )
-    df_plot = df_plot.loc[df_plot['dataset'] == dataset]
+    # lookup coords
+    row = metadata_df.loc[metadata_df['code'] == station_code]
+    if row.empty:
+        raise KeyError(f"station {station_code} not in metadata")
+    row = row.iloc[0]
+    lat_ref, lon_ref = float(row['location.latitude']), float(row['location.longitude'])
 
-    # --- Identify best & worst stations ---
-    best_station = df_plot.loc[df_plot[sigma_high].idxmax()]
-    worst_station = df_plot.loc[df_plot[sigma_high].idxmin()]
+    tahmo_series = tahmo_da.sel(station=station_code).values.astype(float)
 
-    # --- Create figure ---
-    fig, ax = plt.subplots(
-        figsize=(7, 8),
-        subplot_kw={'projection': ccrs.PlateCarree()}
-    )
+    # helper: smoothing
+    def smooth_1d(series, sigma_val):
+        if sigma_val is None or sigma_val == 0:
+            return series.copy()
+        s = np.asarray(series, dtype=float)
+        mask = np.isfinite(s)
+        if mask.sum() == 0:
+            return np.full_like(s, np.nan)
+        s0 = np.where(mask, s, 0.0)
+        num = gaussian_filter1d(s0, sigma=sigma_val, mode='nearest')
+        w = gaussian_filter1d(mask.astype(float), sigma=sigma_val, mode='nearest')
+        return np.where(w > 1e-6, num / w, np.nan)
 
-    # --- Add map features ---
-    ax.set_extent([33.5, 42.5, -5, 5])  # Kenya region
-    ax.add_feature(cfeature.BORDERS, linewidth=1)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-    ax.add_feature(cfeature.LAKES, alpha=0.5)
-    ax.add_feature(cfeature.RIVERS, alpha=0.3)
-    ax.add_feature(cfeature.LAND, facecolor="whitesmoke")
+    # TAHMO smoothed
+    tahmo_s0 = smooth_1d(tahmo_series, sig0)
+    tahmo_sS = smooth_1d(tahmo_series, sigma)
 
-    # --- Plot all stations ---
-    sc = ax.scatter(
-        df_plot['lon'], df_plot['lat'],
-        c=df_plot['delta_r'], cmap=cmap,
-        s=60, edgecolor='k', linewidth=0.5,
-        transform=ccrs.PlateCarree()
-    )
+    time_idx = pd.to_datetime(tahmo_da["time"].values) if "time" in tahmo_da.dims else np.arange(len(tahmo_series))
+    colors = plt.cm.tab10.colors
+    diagnostics = []
 
-    # --- Highlight best station ---
-    ax.scatter(best_station['lon'], best_station['lat'],
-               s=120, c='green', edgecolor='black', marker='^', label='Best Δr',
-               transform=ccrs.PlateCarree())
+    # Plot
+    if plot_show or save_dir:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 
-    ax.annotate(
-        f"{best_station['station_code']} (Best)",
-        xy=(best_station['lon'], best_station['lat']),
-        xytext=(best_station['lon'] + 0.3, best_station['lat'] + 0.3),
-        arrowprops=dict(facecolor='green', arrowstyle='->', lw=1.5),
-        fontsize=9,
-        transform=ccrs.PlateCarree()
-    )
+    for i, (other_da, name) in enumerate(other_datasets):
+        sel = other_da.sel(lat=lat_ref, lon=lon_ref, method="nearest")
+        other_series = sel.values.astype(float)
+        lat_other, lon_other = float(sel.lat.values), float(sel.lon.values)
 
-    # --- Highlight worst station ---
-    ax.scatter(worst_station['lon'], worst_station['lat'],
-               s=120, c='red', edgecolor='black', marker='v', label='Worst Δr',
-               transform=ccrs.PlateCarree())
+        dist_km = haversine_km(lat_ref, lon_ref, lat_other, lon_other)
+        other_s0 = smooth_1d(other_series, sig0)
+        other_sS = smooth_1d(other_series, sigma)
 
-    ax.annotate(
-        f"{worst_station['station_code']} (Worst)",
-        xy=(worst_station['lon'], worst_station['lat']),
-        xytext=(worst_station['lon'] + 0.3, worst_station['lat'] - 0.5),
-        arrowprops=dict(facecolor='red', arrowstyle='->', lw=1.5),
-        fontsize=9,
-        transform=ccrs.PlateCarree()
-    )
+        r_raw = safe_pearson(tahmo_s0, other_s0)
+        r_smooth = safe_pearson(tahmo_sS, other_sS)
+        delta_r = r_smooth - r_raw
 
-    # --- Add colorbar & legend ---
-    cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
-    cb.set_label(f"Δ Correlation (σ={sigma_high} − σ={sigma_low})")
+        diagnostics.append({
+            "dataset": name,
+            "station_code": station_code,
+            "lat_ref": lat_ref,
+            "lon_ref": lon_ref,
+            "lat_other": lat_other,
+            "lon_other": lon_other,
+            "distance_km": dist_km,
+            "corr_raw": r_raw,
+            "corr_sigma": r_smooth,
+            "delta_r": delta_r,
+        })
 
-    ax.legend(loc='lower left', fontsize=9)
-    plt.title("Change in Station Correlation after Smoothing (Kenya)", fontsize=12)
-    plt.show()
+        if plot_show or save_dir:
+            axes[0].plot(time_idx, other_s0, '--', label=f"{name} raw (r={r_raw:.2f})", color=colors[i % len(colors)])
+            axes[1].plot(time_idx, other_sS, '--', label=f"{name} σ={sigma} (r={r_smooth:.2f})", color=colors[i % len(colors)])
+
+    if plot_show or save_dir:
+        axes[0].plot(time_idx, tahmo_s0, label="TAHMO raw", color="black")
+        axes[1].plot(time_idx, tahmo_sS, label=f"TAHMO σ={sigma}", color="black")
+        axes[0].legend()
+        axes[1].legend()
+        axes[0].set_title(f"{station_code} correlations σ=0")
+        axes[1].set_title(f"{station_code} correlations σ={sigma}")
+        plt.tight_layout()
+
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            plot_path = os.path.join(save_dir, f"{station_code}_multi_corr.png")
+            fig.savefig(plot_path, dpi=150)
+            json_path = os.path.join(save_dir, f"{station_code}_diagnostics.json")
+            with open(json_path, "w") as f:
+                json.dump(diagnostics, f, indent=2)
+        if plot_show:
+            plt.show()
+        plt.close(fig)
+
+    return diagnostics
+
+def compute_multi_dataset_metric(df, datasets, sigma=5):
+    subset = df.query(f"sigma == {sigma} and dataset in @datasets")
+    agg = subset.groupby("station_code").agg(
+        mean_corr=("correlation", "mean"),
+        std_corr=("correlation", "std"),
+        n_datasets=("dataset", "count")
+    ).reset_index()
+    agg["consistency_score"] = agg["mean_corr"] - agg["std_corr"]
+    return agg
+    
+def inspect_best_worst_multi(
+    df,
+    metadata_df,
+    tahmo_da,
+    other_datasets,
+    sigma=5,
+    topk=3,
+    sig0=0,
+    save_dir=None
+):
+    metric_df = compute_multi_dataset_metric(df, datasets=[n for _, n in other_datasets], sigma=sigma)
+    best = metric_df.nlargest(topk, "consistency_score")["station_code"]
+    worst = metric_df.nsmallest(topk, "consistency_score")["station_code"]
+
+    results = {"best": [], "worst": []}
+    os.makedirs(save_dir, exist_ok=True)
+
+    for kind, codes in {"best": best, "worst": worst}.items():
+        kind_dir = os.path.join(save_dir, kind) if save_dir else None
+        for code in codes:
+            diags = plot_station_pair_time_series_multi(
+                code, metadata_df, tahmo_da, other_datasets,
+                sigma=sigma, sig0=sig0, plot_show=True, save_dir=kind_dir
+            )
+            results[kind].append({d["dataset"]: d for d in diags})
+    return results
+
+
+# def plot_sigma_map_cartopy(df_corr, df_delta, dataset="CHIRPS", sigma_low=0, sigma_high=5, cmap="RdBu_r", bbox:list[float]=[33.5, 42.5, -5, 5], region_name="Kenya"):
+#     """
+#     Plot correlation differences on a map of Kenya using Cartopy, highlighting
+#     the best and worst Δ correlation stations with arrows and labels.
+
+#     Parameters:
+#         df_corr (pd.DataFrame): Columns are station_code, lat, lon, dataset, and correlation.
+#         df_delta (pd.DataFrame): Columns are station_code and delta_r.
+#     """
+#     # --- Merge coordinate + delta info ---
+#     df_plot = df_corr[['station_code', 'lat', 'lon']].drop_duplicates().merge(
+#         df_delta, on='station_code', how='inner'
+#     )
+#     df_plot = df_plot.loc[df_plot['dataset'] == dataset]
+
+#     # --- Identify best & worst stations ---
+#     best_station = df_plot.loc[df_plot[sigma_high].idxmax()]
+#     worst_station = df_plot.loc[df_plot[sigma_high].idxmin()]
+
+#     # --- Create figure ---
+#     fig, ax = plt.subplots(
+#         figsize=(7, 8),
+#         subplot_kw={'projection': ccrs.PlateCarree()}
+#     )
+
+#     # --- Add map features ---
+#     ax.set_extent(bbox)  # Kenya region
+#     ax.add_feature(cfeature.BORDERS, linewidth=1)
+#     ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+#     ax.add_feature(cfeature.LAKES, alpha=0.5)
+#     ax.add_feature(cfeature.RIVERS, alpha=0.3)
+#     ax.add_feature(cfeature.LAND, facecolor="whitesmoke")
+
+#     # --- Plot all stations ---
+#     sc = ax.scatter(
+#         df_plot['lon'], df_plot['lat'],
+#         c=df_plot['delta_r'], cmap=cmap,
+#         s=60, edgecolor='k', linewidth=0.5,
+#         transform=ccrs.PlateCarree()
+#     )
+
+#     # --- Highlight best station ---
+#     ax.scatter(best_station['lon'], best_station['lat'],
+#                s=120, c='green', edgecolor='black', marker='^', label='Best Δr',
+#                transform=ccrs.PlateCarree())
+
+#     ax.annotate(
+#         f"{best_station['station_code']} (Best)",
+#         xy=(best_station['lon'], best_station['lat']),
+#         xytext=(best_station['lon'] + 0.3, best_station['lat'] + 0.3),
+#         arrowprops=dict(facecolor='green', arrowstyle='->', lw=1.5),
+#         fontsize=9,
+#         transform=ccrs.PlateCarree()
+#     )
+
+#     # --- Highlight worst station ---
+#     ax.scatter(worst_station['lon'], worst_station['lat'],
+#                s=120, c='red', edgecolor='black', marker='v', label='Worst Δr',
+#                transform=ccrs.PlateCarree())
+
+#     ax.annotate(
+#         f"{worst_station['station_code']} (Worst)",
+#         xy=(worst_station['lon'], worst_station['lat']),
+#         xytext=(worst_station['lon'] + 0.3, worst_station['lat'] - 0.5),
+#         arrowprops=dict(facecolor='red', arrowstyle='->', lw=1.5),
+#         fontsize=9,
+#         transform=ccrs.PlateCarree()
+#     )
+
+#     # --- Add colorbar & legend ---
+#     cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
+#     cb.set_label(f"Δ Correlation (σ={sigma_high} − σ={sigma_low})")
+
+#     ax.legend(loc='lower left', fontsize=9)
+#     plt.title(f"Change in Station Correlation after Smoothing {region_name}", fontsize=12)
+#     plt.show()
