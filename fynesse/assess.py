@@ -10,6 +10,12 @@ from random import sample
 import numpy as np
 from . import address
 
+import os
+import json
+from scipy.signal import correlate
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import fftconvolve
+from tqdm.notebook import tqdm
 
 
 # Set up logging
@@ -384,3 +390,283 @@ def compute_station_correlations_df(
             print(f"Skipping station {station_code} due to error: {e}")
 
     return pd.DataFrame(all_results)
+
+
+def safe_pearson(a, b):
+    """NaN-safe Pearson correlation."""
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() < 2:
+        return np.nan
+    a, b = a[mask], b[mask]
+    if np.all(a == a[0]) or np.all(b == b[0]):
+        return np.nan
+    return np.corrcoef(a, b)[0, 1]
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Compute great-circle distance between two points (in km)."""
+    R = 6371.0
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(np.radians(lat1))
+        * np.cos(np.radians(lat2))
+        * np.sin(dlon / 2) ** 2
+    )
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+
+def cross_corr_with_lag(a, b, max_lag=7, use_causal=False):
+    """
+    Compute cross-correlation and find the lag with maximum correlation.
+    Returns (best_corr, best_lag)
+    """
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() < 3:
+        return np.nan, np.nan
+
+    a = a[mask]
+    b = b[mask]
+    a -= np.nanmean(a)
+    b -= np.nanmean(b)
+    if np.std(a) == 0 or np.std(b) == 0:
+        return np.nan, np.nan
+
+    corr = correlate(b, a, mode="full", method="auto")
+    lags = np.arange(-len(a) + 1, len(a))
+
+    if use_causal:
+        # zero out future contributions to enforce causal correlation
+        corr[lags < 0] = np.nan
+
+    lag_mask = np.abs(lags) <= max_lag
+    corr = corr[lag_mask]
+    lags = lags[lag_mask]
+
+    if corr.size == 0:
+        return np.nan, np.nan
+
+    best_idx = np.nanargmax(corr)
+    norm = np.sqrt(np.nansum(a ** 2) * np.nansum(b ** 2))
+    best_corr = corr[best_idx] / norm
+    best_lag = lags[best_idx]
+    return float(best_corr), int(best_lag)
+
+
+def smooth_1d(series, sigma_val):
+    """Gaussian smoothing with NaN handling (non-causal)."""
+    if sigma_val is None or sigma_val == 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s)
+    if mask.sum() == 0:
+        return np.full_like(s, np.nan)
+    s0 = np.where(mask, s, 0.0)
+    num = gaussian_filter1d(s0, sigma=sigma_val, mode="nearest")
+    w = gaussian_filter1d(mask.astype(float), sigma=sigma_val, mode="nearest")
+    return np.where(w > 1e-6, num / w, np.nan)
+
+
+def smooth_1d_causal(series, sigma_val):
+    """Causal Gaussian smoothing (past-to-present only)."""
+    if sigma_val is None or sigma_val == 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s)
+    if mask.sum() == 0:
+        return np.full_like(s, np.nan)
+    s0 = np.where(mask, s, 0.0)
+    
+    # manual causal kernel
+    # Half width = 3 * sigma val, includes 99.7 % of the Gaussian's total area
+    # since 3 * sigma covers almost all weight
+    half_width = int(3 * sigma_val) # How far back in time the smoother looks (in samples)
+    kernel = np.exp(-0.5 * (np.arange(0, half_width + 1) / sigma_val) ** 2)
+    kernel /= kernel.sum()
+    out = np.full_like(s0, np.nan)
+    for i in range(len(s0)):
+        i0 = max(0, i - half_width)
+        w = kernel[-(i - i0 + 1):]
+        seg = s0[i0:i + 1]
+        m = mask[i0:i + 1]
+        if m.sum() == 0:
+            continue
+        out[i] = np.sum(seg[m] * w[m]) / np.sum(w[m])
+    return out
+
+
+# -----------------------------------------------
+# === Main diagnostics ===
+# -----------------------------------------------
+
+def diagnostics_for_station(
+    station_code,
+    metadata_df,
+    tahmo_da,
+    other_das_dict,
+    sigmas=(0, 5),
+    max_lag=7,
+    use_causal=False,
+    save_dir=None
+):
+    """Compute correlation and lag diagnostics for one station."""
+
+    if not isinstance(other_das_dict, dict):
+        raise TypeError(f"Expected dict for other_das_dict, got {type(other_das_dict)}")
+
+    row = metadata_df.loc[metadata_df["code"] == station_code]
+    if row.empty:
+        raise KeyError(f"Station {station_code} not found in metadata")
+    row = row.iloc[0]
+    lat_ref, lon_ref = float(row["location.latitude"]), float(row["location.longitude"])
+
+    tahmo_series = tahmo_da.sel(station=station_code).values.astype(float)
+    diagnostics = []
+
+    for name, other_da in other_das_dict.items():
+        sel = other_da.sel(lat=lat_ref, lon=lon_ref, method="nearest")
+        other_series = sel.values.astype(float)
+        lat_other, lon_other = float(sel.lat.values), float(sel.lon.values)
+        dist_km = haversine_km(lat_ref, lon_ref, lat_other, lon_other)
+
+        entry = {
+            "dataset": name,
+            "station_code": station_code,
+            "lat_ref": lat_ref,
+            "lon_ref": lon_ref,
+            "lat_other": lat_other,
+            "lon_other": lon_other,
+            "distance_km": dist_km,
+        }
+
+        for sigma in sigmas:
+            if use_causal:
+                tahmo_s = smooth_1d_causal(tahmo_series, sigma)
+                other_s = smooth_1d_causal(other_series, sigma)
+            else:
+                tahmo_s = smooth_1d(tahmo_series, sigma)
+                other_s = smooth_1d(other_series, sigma)
+
+            corr, lag = cross_corr_with_lag(
+                tahmo_s, other_s, max_lag=max_lag, use_causal=use_causal
+            )
+            entry[f"corr_sigma_{sigma}"] = corr
+            entry[f"lag_sigma_{sigma}"] = lag
+
+        diagnostics.append(entry)
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, f"{station_code}_diagnostics.json")
+        with open(out_path, "w") as f:
+            json.dump(diagnostics, f, indent=2)
+
+    return diagnostics
+
+
+# -----------------------------------------------
+# === Batch run for all stations ===
+# -----------------------------------------------
+
+def run_all_station_diagnostics(
+    metadata_df,
+    tahmo_da,
+    other_das_dict,
+    sigmas=(0, 5),
+    max_lag=7,
+    use_causal=False,
+    station_list=None,
+    save_dir=None
+):
+    """Run diagnostics across all stations."""
+    if not isinstance(other_das_dict, dict):
+        raise TypeError(f"Expected dict for other_das_dict, got {type(other_das_dict)}")
+
+    if station_list is None:
+        station_list = metadata_df["code"].tolist()
+
+    all_results = []
+    for st in tqdm(station_list, desc="Running station diagnostics"):
+        try:
+            diag = diagnostics_for_station(
+                st,
+                metadata_df,
+                tahmo_da,
+                other_das_dict,
+                sigmas=sigmas,
+                max_lag=max_lag,
+                use_causal=use_causal,
+                save_dir=save_dir,
+            )
+            all_results.extend(diag)
+        except Exception as e:
+            print(f"⚠️ Skipping {st}: {e}")
+            continue
+
+    if save_dir:
+        all_json = os.path.join(save_dir, "all_station_diagnostics.json")
+        with open(all_json, "w") as f:
+            json.dump(all_results, f, indent=2)
+
+    return pd.DataFrame(all_results)
+
+def smooth_centered(series, sigma):
+    """Centered Gaussian smoothing (using SciPy) with NaN handling."""
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s)
+    if mask.sum() == 0 or sigma <= 0:
+        return series.copy()
+    s0 = np.where(mask, s, 0.0)
+    num = gaussian_filter1d(s0, sigma=sigma, mode='nearest')
+    w = gaussian_filter1d(mask.astype(float), sigma=sigma, mode='nearest')
+    out = np.where(w > 1e-6, num / w, np.nan)
+    return out
+
+def smooth_causal(series, sigma, truncate=4.0):
+    """
+    One-sided (causal) Gaussian-like smoothing: kernel uses past & present.
+    """
+    if sigma <= 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s).astype(float)
+    s0 = np.where(mask > 0, s, 0.0)
+
+    radius = int(truncate * sigma + 0.5)
+    idx = np.arange(-radius, radius+1)
+    gauss = np.exp(-0.5 * (idx / float(sigma))**2)
+    gauss_causal = np.where(idx <= 0, gauss, 0.0)
+    if gauss_causal.sum() == 0:
+        return series.copy()
+    kernel = gauss_causal / gauss_causal.sum()
+
+    num = fftconvolve(s0, kernel, mode='same')
+    denom = fftconvolve(mask, kernel, mode='same')
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = np.where(denom > 1e-8, num / denom, np.nan)
+    return out
+
+def smooth_causal_padded(series, sigma, truncate=4.0):
+    if sigma <= 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s).astype(float)
+    s0 = np.where(mask > 0, s, 0.0)
+
+    radius = int(truncate * sigma + 0.5)
+    idx = np.arange(-radius, radius+1)
+    gauss = np.exp(-0.5 * (idx / sigma)**2)
+    gauss_causal = np.where(idx <= 0, gauss, 0.0)
+    kernel = gauss_causal / gauss_causal.sum()
+
+    # pad on both sides with zeros to prevent wraparound
+    pad = len(kernel)
+    s_pad = np.pad(s0, (pad, pad), mode='constant', constant_values=0)
+    m_pad = np.pad(mask, (pad, pad), mode='constant', constant_values=0)
+
+    num = fftconvolve(s_pad, kernel, mode='same')[pad:-pad]
+    denom = fftconvolve(m_pad, kernel, mode='same')[pad:-pad]
+
+    out = np.where(denom > 1e-8, num / denom, np.nan)
+    return out
