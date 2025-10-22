@@ -2,7 +2,6 @@ from typing import Any, Union
 import pandas as pd
 import logging
 
-from .config import *
 from . import access
 import osmnx as ox
 import matplotlib.pyplot as plt
@@ -163,7 +162,7 @@ def get_feature_vector(latitude, longitude, box_size_km=2, features=None):
     feature_vector : dict
         Dictionary of feature counts, keyed by (key, value).
     """
-    from osmnx.features import InsufficientResponseError
+    from ox.features import InsufficientResponseError
 
     bbox = access.get_osm_datapoints(latitude, longitude)
 
