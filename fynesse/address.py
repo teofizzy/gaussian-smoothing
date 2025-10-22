@@ -626,6 +626,12 @@ def smooth_causal_padded(series, sigma, truncate=4.0):
     with np.errstate(divide='ignore', invalid='ignore'):
         return np.where(denom > 1e-8, num / denom, np.nan)
 
+SMOOTHING_METHODS = {
+    "centered": smooth_centered,
+    "causal": smooth_causal,
+    "causal_padded": smooth_causal_padded,
+}
+
 def plot_station_pair_time_series_multi(
     station_code,
     metadata_df,
