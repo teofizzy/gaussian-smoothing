@@ -18,8 +18,8 @@ import xarray as xr
 import math
 import os
 from typing import Tuple, Dict
-# import cartopy.crs as ccrs
-# import cartopy.feature as cfeature
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -33,6 +33,9 @@ import sklearn.tree as tree
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import fftconvolve
 
 # import GPy
 # import torch
@@ -575,23 +578,77 @@ def haversine_km(lat1, lon1, lat2, lon2):
     c = 2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
+def smooth_centered(series, sigma):
+    """Centered Gaussian smoothing (using SciPy) with NaN handling."""
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s)
+    if mask.sum() == 0 or sigma <= 0:
+        return series.copy()
+    s0 = np.where(mask, s, 0.0)
+    num = gaussian_filter1d(s0, sigma=sigma, mode='nearest')
+    w = gaussian_filter1d(mask.astype(float), sigma=sigma, mode='nearest')
+    return np.where(w > 1e-6, num / w, np.nan)
+
+def smooth_causal(series, sigma, truncate=4.0):
+    """One-sided (causal) Gaussian smoothing using FFT."""
+    if sigma <= 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s).astype(float)
+    s0 = np.where(mask > 0, s, 0.0)
+    radius = int(truncate * sigma + 0.5)
+    idx = np.arange(-radius, radius+1)
+    gauss = np.exp(-0.5 * (idx / float(sigma))**2)
+    gauss_causal = np.where(idx <= 0, gauss, 0.0)
+    kernel = gauss_causal / gauss_causal.sum()
+    num = fftconvolve(s0, kernel, mode='same')
+    denom = fftconvolve(mask, kernel, mode='same')
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(denom > 1e-8, num / denom, np.nan)
+
+def smooth_causal_padded(series, sigma, truncate=4.0):
+    """Causal smoothing with zero-padding to remove FFT wrap artifacts."""
+    if sigma <= 0:
+        return series.copy()
+    s = np.asarray(series, dtype=float)
+    mask = np.isfinite(s).astype(float)
+    s0 = np.where(mask > 0, s, 0.0)
+    radius = int(truncate * sigma + 0.5)
+    idx = np.arange(-radius, radius+1)
+    gauss = np.exp(-0.5 * (idx / sigma)**2)
+    gauss_causal = np.where(idx <= 0, gauss, 0.0)
+    kernel = gauss_causal / gauss_causal.sum()
+    pad = len(kernel)
+    s_pad = np.pad(s0, (pad, pad), mode='constant', constant_values=0)
+    m_pad = np.pad(mask, (pad, pad), mode='constant', constant_values=0)
+    num = fftconvolve(s_pad, kernel, mode='same')[pad:-pad]
+    denom = fftconvolve(m_pad, kernel, mode='same')[pad:-pad]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(denom > 1e-8, num / denom, np.nan)
+
 def plot_station_pair_time_series_multi(
     station_code,
     metadata_df,
     tahmo_da,
-    other_datasets,  # list of tuples: [(other_da, "CHIRPS"), (other_da2, "ERA5"), ...]
+    other_datasets,
     sigma=5,
     sig0=0,
     kernel_for_other="temporal",
     plot_show=True,
-    save_dir=None
+    save_dir=None,
+    smoothing_method="centered",  # NEW
 ):
     """
-    Plot TAHMO vs multiple other datasets (sampled at station lat/lon)
-    for sigma=sig0 and sigma=sigma.
-    Optionally saves the plot and diagnostic JSON to `save_dir`.
+    Plot TAHMO vs multiple other datasets for sigma=sig0 and sigma=sigma.
+    Now supports different smoothing methods: 'centered', 'causal', 'causal_padded'.
     """
-    # lookup coords
+    # Get smoother
+    if smoothing_method not in SMOOTHING_METHODS:
+        raise ValueError(f"Unknown smoothing method '{smoothing_method}'. "
+                         f"Available: {list(SMOOTHING_METHODS.keys())}")
+    smoother = SMOOTHING_METHODS[smoothing_method]
+
+    # lookup station coords
     row = metadata_df.loc[metadata_df['code'] == station_code]
     if row.empty:
         raise KeyError(f"station {station_code} not in metadata")
@@ -599,29 +656,13 @@ def plot_station_pair_time_series_multi(
     lat_ref, lon_ref = float(row['location.latitude']), float(row['location.longitude'])
 
     tahmo_series = tahmo_da.sel(station=station_code).values.astype(float)
-
-    # helper: smoothing
-    def smooth_1d(series, sigma_val):
-        if sigma_val is None or sigma_val == 0:
-            return series.copy()
-        s = np.asarray(series, dtype=float)
-        mask = np.isfinite(s)
-        if mask.sum() == 0:
-            return np.full_like(s, np.nan)
-        s0 = np.where(mask, s, 0.0)
-        num = gaussian_filter1d(s0, sigma=sigma_val, mode='nearest')
-        w = gaussian_filter1d(mask.astype(float), sigma=sigma_val, mode='nearest')
-        return np.where(w > 1e-6, num / w, np.nan)
-
-    # TAHMO smoothed
-    tahmo_s0 = smooth_1d(tahmo_series, sig0)
-    tahmo_sS = smooth_1d(tahmo_series, sigma)
+    tahmo_s0 = smoother(tahmo_series, sig0)
+    tahmo_sS = smoother(tahmo_series, sigma)
 
     time_idx = pd.to_datetime(tahmo_da["time"].values) if "time" in tahmo_da.dims else np.arange(len(tahmo_series))
     colors = plt.cm.tab10.colors
     diagnostics = []
 
-    # Plot
     if plot_show or save_dir:
         fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 
@@ -629,10 +670,10 @@ def plot_station_pair_time_series_multi(
         sel = other_da.sel(lat=lat_ref, lon=lon_ref, method="nearest")
         other_series = sel.values.astype(float)
         lat_other, lon_other = float(sel.lat.values), float(sel.lon.values)
-
         dist_km = haversine_km(lat_ref, lon_ref, lat_other, lon_other)
-        other_s0 = smooth_1d(other_series, sig0)
-        other_sS = smooth_1d(other_series, sigma)
+
+        other_s0 = smoother(other_series, sig0)
+        other_sS = smoother(other_series, sigma)
 
         r_raw = safe_pearson(tahmo_s0, other_s0)
         r_smooth = safe_pearson(tahmo_sS, other_sS)
@@ -641,6 +682,7 @@ def plot_station_pair_time_series_multi(
         diagnostics.append({
             "dataset": name,
             "station_code": station_code,
+            "smoothing_method": smoothing_method,
             "lat_ref": lat_ref,
             "lon_ref": lon_ref,
             "lat_other": lat_other,
@@ -658,19 +700,19 @@ def plot_station_pair_time_series_multi(
     if plot_show or save_dir:
         axes[0].plot(time_idx, tahmo_s0, label="TAHMO raw", color="black")
         axes[1].plot(time_idx, tahmo_sS, label=f"TAHMO σ={sigma}", color="black")
-        axes[0].legend()
-        axes[1].legend()
-        axes[0].set_title(f"{station_code} correlations σ=0")
-        axes[1].set_title(f"{station_code} correlations σ={sigma}")
+        axes[0].legend(); axes[1].legend()
+        axes[0].set_title(f"{station_code} correlations σ=0 [{smoothing_method}]")
+        axes[1].set_title(f"{station_code} correlations σ={sigma} [{smoothing_method}]")
         plt.tight_layout()
 
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-            plot_path = os.path.join(save_dir, f"{station_code}_multi_corr.png")
+            plot_path = os.path.join(save_dir, f"{station_code}_multi_corr_{smoothing_method}.png")
             fig.savefig(plot_path, dpi=150)
-            json_path = os.path.join(save_dir, f"{station_code}_diagnostics.json")
+            json_path = os.path.join(save_dir, f"{station_code}_diagnostics_{smoothing_method}.json")
             with open(json_path, "w") as f:
                 json.dump(diagnostics, f, indent=2)
+
         if plot_show:
             plt.show()
         plt.close(fig)
@@ -695,7 +737,8 @@ def inspect_best_worst_multi(
     sigma=5,
     topk=3,
     sig0=0,
-    save_dir=None
+    save_dir=None,
+    smoothing_method="centered",  # NEW
 ):
     metric_df = compute_multi_dataset_metric(df, datasets=[n for _, n in other_datasets], sigma=sigma)
     best = metric_df.nlargest(topk, "consistency_score")["station_code"]
@@ -709,11 +752,11 @@ def inspect_best_worst_multi(
         for code in codes:
             diags = plot_station_pair_time_series_multi(
                 code, metadata_df, tahmo_da, other_datasets,
-                sigma=sigma, sig0=sig0, plot_show=True, save_dir=kind_dir
+                sigma=sigma, sig0=sig0, plot_show=True,
+                save_dir=kind_dir, smoothing_method=smoothing_method
             )
             results[kind].append({d["dataset"]: d for d in diags})
     return results
-
 
 def plot_sigma_map_cartopy(df_corr, df_delta, dataset="CHIRPS", sigma_low=0, sigma_high=5, cmap="RdBu_r", bbox:list[float]=[33.5, 42.5, -5, 5], region_name="Kenya"):
     """
